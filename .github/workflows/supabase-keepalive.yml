@@ -1,0 +1,68 @@
+name: Supabase Keep Alive (All Projects)
+
+on:
+  schedule:
+    - cron: "0 3 */2 * *"   # every 2 days at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Ping all Supabase projects
+        env:
+          PROJECTS_JSON: ${{ secrets.PROJECTS_JSON }}
+        run: |
+          node - <<'NODE'
+          const projects = JSON.parse(process.env.PROJECTS_JSON || "[]");
+          if (!projects.length) {
+            console.log("No projects found in PROJECTS_JSON");
+            process.exit(1);
+          }
+
+          async function ping(p) {
+            const endpoint = `${p.url}/rest/v1/keepalive?select=id&limit=1`;
+            const res = await fetch(endpoint, {
+              headers: {
+                apikey: p.anon,
+                Authorization: `Bearer ${p.anon}`,
+                Accept: "application/json",
+              },
+            });
+            const text = await res.text();
+            return { name: p.name, status: res.status, body: text.slice(0, 200) };
+          }
+
+          (async () => {
+            let failed = 0;
+            for (const p of projects) {
+              try {
+                const r = await ping(p);
+                console.log(`${r.name}: ${r.status}`);
+                if (r.status >= 400) {
+                  failed++;
+                  console.log(`  body: ${r.body}`);
+                }
+              } catch (e) {
+                failed++;
+                console.log(`${p.name}: ERROR ${e.message}`);
+              }
+            }
+            if (failed) process.exit(1);
+          })();
+          NODE
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MSG="❌ Supabase keepalive failed: ${{ github.repository }} | Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -d "chat_id=$CHAT_ID" \
+            --data-urlencode "text=$MSG"
