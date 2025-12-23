@@ -2,24 +2,23 @@ name: Supabase Keep Alive (All Projects)
 
 on:
   schedule:
-    - cron: "0 3 */2 * *" # every 2 days at 03:00 UTC
+    - cron: "0 3 */2 * *"   # every 2 days at 03:00 UTC
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Ping all Supabase projects
+        env:
+          PROJECTS_JSON: ${{ secrets.PROJECTS_JSON }}
         run: |
           node - <<'NODE'
-          const fs = require('fs');
-          const projects = JSON.parse(fs.readFileSync('projects.json', 'utf8'));
+          const projects = JSON.parse(process.env.PROJECTS_JSON || "[]");
           if (!projects.length) {
             console.log("No projects found in PROJECTS_JSON");
             process.exit(1);
