@@ -2,7 +2,7 @@ name: Supabase Keep Alive (All Projects)
 
 on:
   schedule:
-    - cron: "0 3 */2 * *"   # every 2 days at 03:00 UTC
+    - cron: "0 3 */2 * *" # every 2 days at 03:00 UTC
   workflow_dispatch:
 
 jobs:
