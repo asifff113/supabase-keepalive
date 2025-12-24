@@ -25,7 +25,8 @@ jobs:
           }
 
           async function ping(p) {
-            const endpoint = `${p.url}/rest/v1/keepalive?select=id&limit=1`;
+            // Ping the REST API root - always exists, no table needed
+            const endpoint = `${p.url}/rest/v1/`;
             const res = await fetch(endpoint, {
               headers: {
                 apikey: p.anon,
