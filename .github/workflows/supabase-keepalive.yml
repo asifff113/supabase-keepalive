@@ -18,42 +18,115 @@ jobs:
           PROJECTS_JSON: ${{ secrets.PROJECTS_JSON }}
         run: |
           node - <<'NODE'
-          const projects = JSON.parse(process.env.PROJECTS_JSON || "[]");
-          if (!projects.length) {
-            console.log("No projects found in PROJECTS_JSON");
+          const raw = process.env.PROJECTS_JSON || "[]";
+          let projects;
+          
+          try {
+            projects = JSON.parse(raw);
+          } catch (e) {
+            console.log("❌ PROJECTS_JSON is not valid JSON");
+            console.log("Error:", e.message);
             process.exit(1);
           }
 
-          async function ping(p) {
-            // Ping the REST API root - always exists, no table needed
-            const endpoint = `${p.url}/rest/v1/`;
-            const res = await fetch(endpoint, {
-              headers: {
-                apikey: p.anon,
-                Authorization: `Bearer ${p.anon}`,
-                Accept: "application/json",
-              },
-            });
-            const text = await res.text();
-            return { name: p.name, status: res.status, body: text.slice(0, 200) };
+          if (!Array.isArray(projects) || projects.length === 0) {
+            console.log("❌ No projects found in PROJECTS_JSON");
+            process.exit(1);
+          }
+
+          console.log(`📊 Found ${projects.length} project(s) to ping\n`);
+
+          async function ping(p, retries = 2) {
+            if (!p || !p.url || !p.anon) {
+              throw new Error("Missing url or anon key");
+            }
+
+            const name = p.name || "unnamed";
+            const base = String(p.url).replace(/\/+$/, "");
+            const endpoint = `${base}/rest/v1/`;
+
+            for (let attempt = 0; attempt <= retries; attempt++) {
+              let timeout; // declare outside try so catch can access
+              try {
+                const controller = new AbortController();
+                timeout = setTimeout(() => controller.abort(), 15000);
+
+                const res = await fetch(endpoint, {
+                  signal: controller.signal,
+                  headers: {
+                    apikey: p.anon,
+                    Authorization: `Bearer ${p.anon}`,
+                    Accept: "application/json",
+                  },
+                });
+
+                clearTimeout(timeout);
+                const text = await res.text();
+
+                return {
+                  name,
+                  status: res.status,
+                  body: text.slice(0, 200),
+                  success: res.status < 400,
+                  attempt: attempt + 1
+                };
+
+              } catch (e) {
+                if (timeout) clearTimeout(timeout);
+                
+                if (attempt < retries) {
+                  const delay = 2000 * (attempt + 1);
+                  console.log(`  ⚠️  Attempt ${attempt + 1} failed for ${name}, retrying in ${delay}ms...`);
+                  await new Promise(r => setTimeout(r, delay));
+                } else {
+                  throw e;
+                }
+              }
+            }
           }
 
           (async () => {
             let failed = 0;
-            for (const p of projects) {
+            let succeeded = 0;
+            const results = [];
+
+            for (let i = 0; i < projects.length; i++) {
+              const p = projects[i];
+              
               try {
                 const r = await ping(p);
-                console.log(`${r.name}: ${r.status}`);
-                if (r.status >= 400) {
+                results.push(r);
+
+                if (r.success) {
+                  succeeded++;
+                  console.log(`✅ ${r.name}: ${r.status}${r.attempt > 1 ? ` (attempt ${r.attempt})` : ''}`);
+                } else {
                   failed++;
-                  console.log(`  body: ${r.body}`);
+                  console.log(`❌ ${r.name}: ${r.status}`);
+                  console.log(`   Response: ${r.body}`);
                 }
+
               } catch (e) {
                 failed++;
-                console.log(`${p.name}: ERROR ${e.message}`);
+                const name = p?.name || "unnamed";
+                console.log(`❌ ${name}: ERROR - ${e.message}`);
+                results.push({ name, error: e.message, success: false });
+              }
+
+              // Small delay between projects to avoid rate limiting
+              if (i < projects.length - 1) {
+                await new Promise(r => setTimeout(r, 500));
               }
             }
-            if (failed) process.exit(1);
+
+            console.log(`\n📈 Summary: ${succeeded} succeeded, ${failed} failed out of ${projects.length} total`);
+
+            if (failed > 0) {
+              console.log("\n❌ Some projects failed - exiting with error code");
+              process.exit(1);
+            }
+
+            console.log("\n✅ All projects are alive!");
           })();
           NODE
 
@@ -63,7 +136,21 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          MSG="❌ Supabase keepalive failed: ${{ github.repository }} | Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "⚠️  Telegram secrets missing; skipping notification."
+            exit 0
+          fi
+          
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG="❌ Supabase Keep-Alive Failed
+
+Repository: ${{ github.repository }}
+Workflow: ${{ github.workflow }}
+Run: ${WORKFLOW_URL}
+
+One or more Supabase projects failed to respond."
+
           curl -sS "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
             -d "chat_id=$CHAT_ID" \
-            --data-urlencode "text=$MSG"
+            --data-urlencode "text=$MSG" \
+            -d "disable_web_page_preview=true"
