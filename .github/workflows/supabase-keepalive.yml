@@ -1,0 +1,190 @@
+name: Supabase Keep Alive (All Projects)
+
+on:
+  schedule:
+    - cron: "0 3 */2 * *" # every 2 days at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping all Supabase projects
+        id: ping
+        uses: actions/github-script@v7
+        env:
+          PROJECTS_JSON: ${{ secrets.PROJECTS_JSON }}
+        with:
+          script: |
+            const raw = process.env.PROJECTS_JSON || "[]";
+            let projects;
+
+            try {
+              projects = JSON.parse(raw);
+            } catch (e) {
+              core.setFailed(`PROJECTS_JSON is not valid JSON: ${e.message}`);
+              return;
+            }
+
+            if (!Array.isArray(projects) || projects.length === 0) {
+              core.setFailed("No projects found in PROJECTS_JSON");
+              return;
+            }
+
+            console.log(`📊 Found ${projects.length} project(s) to ping\n`);
+
+            async function ping(p, retries = 2) {
+              if (!p || !p.url || !p.anon) {
+                throw new Error("Missing url or anon key");
+              }
+
+              const name = p.name || "unnamed";
+              const base = String(p.url).replace(/\/+$/, "");
+              const endpoint = `${base}/rest/v1/`;
+
+              for (let attempt = 0; attempt <= retries; attempt++) {
+                let timeout;
+                try {
+                  const controller = new AbortController();
+                  timeout = setTimeout(() => controller.abort(), 15000);
+
+                  const res = await fetch(endpoint, {
+                    signal: controller.signal,
+                    headers: {
+                      apikey: p.anon,
+                      Authorization: `Bearer ${p.anon}`,
+                      Accept: "application/json",
+                    },
+                  });
+
+                  clearTimeout(timeout);
+                  const text = await res.text();
+
+                  return {
+                    name,
+                    status: res.status,
+                    body: text.slice(0, 200),
+                    success: res.status < 400,
+                    attempt: attempt + 1,
+                  };
+                } catch (e) {
+                  if (timeout) clearTimeout(timeout);
+
+                  if (attempt < retries) {
+                    const delay = 2000 * (attempt + 1);
+                    console.log(`  ⚠️  Attempt ${attempt + 1} failed for ${name}, retrying in ${delay}ms...`);
+                    await new Promise((r) => setTimeout(r, delay));
+                  } else {
+                    throw e;
+                  }
+                }
+              }
+            }
+
+            let failed = 0;
+            let succeeded = 0;
+            const failedProjects = [];
+
+            for (let i = 0; i < projects.length; i++) {
+              const p = projects[i];
+
+              try {
+                const r = await ping(p);
+
+                if (r.success) {
+                  succeeded++;
+                  console.log(`✅ ${r.name}: ${r.status}${r.attempt > 1 ? ` (attempt ${r.attempt})` : ""}`);
+                } else {
+                  failed++;
+                  failedProjects.push(r.name);
+                  console.log(`❌ ${r.name}: ${r.status}`);
+                  console.log(`   Response: ${r.body}`);
+                }
+              } catch (e) {
+                failed++;
+                const name = p?.name || "unnamed";
+                failedProjects.push(name);
+                console.log(`❌ ${name}: ERROR - ${e.message}`);
+              }
+
+              // Small delay between projects to avoid rate limiting
+              if (i < projects.length - 1) {
+                await new Promise((r) => setTimeout(r, 500));
+              }
+            }
+
+            console.log(`\n📈 Summary: ${succeeded} succeeded, ${failed} failed out of ${projects.length} total`);
+
+            // Set outputs for Telegram notification
+            core.setOutput("failed_count", failed);
+            core.setOutput("succeeded_count", succeeded);
+            core.setOutput("total_count", projects.length);
+            core.setOutput("failed_projects", failedProjects.join(", "));
+
+            if (failed > 0) {
+              core.setFailed(`${failed} project(s) failed to respond`);
+            } else {
+              console.log("\n✅ All projects are alive!");
+            }
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "⚠️  Telegram secrets missing; skipping notification."
+            exit 0
+          fi
+
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          FAILED_PROJECTS="${{ steps.ping.outputs.failed_projects }}"
+          FAILED_COUNT="${{ steps.ping.outputs.failed_count }}"
+          TOTAL_COUNT="${{ steps.ping.outputs.total_count }}"
+
+          MSG="❌ Supabase Keep-Alive Failed
+
+          📊 Results: ${FAILED_COUNT}/${TOTAL_COUNT} failed
+          🔴 Failed: ${FAILED_PROJECTS:-Unknown}
+
+          🔗 Repository: ${{ github.repository }}
+          📋 Workflow: ${{ github.workflow }}
+          🔍 Details: ${WORKFLOW_URL}"
+
+          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -d "disable_web_page_preview=true"
+
+      - name: Notify Telegram on success (optional)
+        if: success()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NOTIFY_SUCCESS: ${{ secrets.NOTIFY_SUCCESS }}
+        run: |
+          # Only send success notification if NOTIFY_SUCCESS secret is set to "true"
+          if [ "$NOTIFY_SUCCESS" != "true" ]; then
+            echo "Success notifications disabled"
+            exit 0
+          fi
+
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "⚠️  Telegram secrets missing; skipping notification."
+            exit 0
+          fi
+
+          SUCCEEDED_COUNT="${{ steps.ping.outputs.succeeded_count }}"
+          TOTAL_COUNT="${{ steps.ping.outputs.total_count }}"
+
+          MSG="✅ Supabase Keep-Alive Success
+
+          📊 All ${TOTAL_COUNT} project(s) are alive!
+
+          🔗 Repository: ${{ github.repository }}"
+
+          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -d "disable_web_page_preview=true"
